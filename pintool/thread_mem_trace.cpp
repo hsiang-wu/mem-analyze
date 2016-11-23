@@ -42,6 +42,7 @@ END_LEGAL */
 #include <iostream>
 #include <fstream>
 #include <iomanip>
+#include <sstream>
 #include <map>
 
 #include <sys/types.h>
@@ -62,16 +63,22 @@ static inline VOID* PAGE(VOID* addr)
 /* Global Variables */
 /* ===================================================================== */
 
-std::ofstream TraceFile;
+//std::ofstream TraceFile;
 PIN_LOCK lock;
 char *file_in_mem;
+int fd = -1;
+size_t textsize = 0;
+char *file_begin;
 
-static inline void mem_printf(const char *fmt, ...)
-{
-    va_list args;
-    va_start(args, fmt);
-    file_in_mem += sprintf(file_in_mem, fmt, args);
-}
+#define mem_printf(...) (file_in_mem += sprintf(file_in_mem, __VA_ARGS__))
+
+//static inline void mem_printf(const char *fmt, ...)
+//{
+//    va_list args;
+//    va_start(args, fmt);
+//    file_in_mem += vsprintf(file_in_mem, fmt, args);
+//    //assert((file_in_mem - file_begin) < (int) textsize);
+//}
 
 /* ===================================================================== */
 /* Commandline Switches */
@@ -79,6 +86,8 @@ static inline void mem_printf(const char *fmt, ...)
 
 KNOB<string> KnobOutputFile(KNOB_MODE_WRITEONCE, "pintool",
     "o", "mytrace.out", "specify trace file name");
+KNOB<INT32> KnobFileSize(KNOB_MODE_WRITEONCE, "pintool",
+    "s", "0x40000000"/*1G*/, "specify memory-mapped file size");
 KNOB<BOOL> KnobValues(KNOB_MODE_WRITEONCE, "pintool",
     "values", "1", "Output memory values reads and written");
 
@@ -133,11 +142,19 @@ bool silent[128]; // make it sufficiently large
 static VOID RecordMem(VOID * ip, CHAR r, VOID * addr, BOOL isPrefetch, THREADID threadid)
 {
     PIN_GetLock(&lock, threadid+1);
-    if (!silent[threadid]) {
-        TraceFile << "[" << std::dec << threadid << "]" << std::hex << (INT64) ip << ": " << r 
-                  << " " << std::hex << (INT64) PAGE(addr);
-        TraceFile << endl;
-    }
+        
+    //mem_printf("[%d]%lx: %lc %lx\n", threadid, (INT64) ip, r, (INT64) PAGE(addr));
+    //mem_printf("[%d]%lc %lx\n", threadid, r, (INT64) PAGE(addr));
+
+    // This is the bottleneck of performance. total 10 bytes
+    *file_in_mem++ = threadid; // 1 byte
+    *file_in_mem++ = r; // 1 byte
+    *(INT64 *)(file_in_mem) = (INT64) PAGE(addr); // 8 bytes
+    file_in_mem += sizeof(INT64);
+    
+    //*file_in_mem++ = '\n';
+    //mem_printf("[%d]%lc %p\n", threadid, r, PAGE(addr));
+
     PIN_ReleaseLock(&lock);
 }
 
@@ -160,8 +177,9 @@ string queues[] = {"tq_dequeue"};
 VOID BeforeFunc(INT32 i, THREADID threadid )
 {
     PIN_GetLock(&lock, threadid+1);
-    TraceFile << "=== PHASE : " << phases[i] << " ===";
-    TraceFile << endl;
+    //TraceFile << "=== PHASE : " << phases[i] << " ===";
+    //TraceFile << endl;
+    mem_printf("=== PHASE : %s ===\n", phases[i].c_str());
     printf("=== PHASE : %s ===\n", phases[i].c_str());
     PIN_ReleaseLock(&lock);
 }
@@ -181,7 +199,7 @@ VOID Silent(ADDRINT tq, THREADID threadid)
 {
     PIN_GetLock(&lock, threadid+1);
   //std::cout << "silent" << threadid << endl;
-    if (threadid < 128) silent[threadid] = 1;
+    //if (threadid < 128) silent[threadid] = 1;
     if (addr_count.find(tq) == addr_count.end())
       addr_count[tq] = 0;
     else
@@ -193,7 +211,7 @@ VOID Unsilent(INT32 i, THREADID threadid)
 {
     PIN_GetLock(&lock, threadid+1);
   //std::cout << "unsilent" << threadid << endl;
-  if (threadid < 128) silent[threadid] = 0;
+  //if (threadid < 128) silent[threadid] = 0;
     PIN_ReleaseLock(&lock);
 }
 
@@ -303,8 +321,24 @@ VOID Fini(INT32 code, VOID *v)
     for (std::map<ADDRINT, int>::iterator it = addr_count.begin(); it != addr_count.end(); it++) {
       std::cout << std::hex << it->first << " , " << it->second << endl;
     }
+
+    // ohhh... mremap is "not yet implemented" by pin...
+    //mremap(file_begin, textsize, file_in_mem - file_begin, 0);
+ 
+    std::cout << "actually filesize: " << std::dec << ((UINT64) file_in_mem - (UINT64)file_begin) / 1024 / 1024  << "M" << endl;
     
-    TraceFile.close();
+    //TraceFile.close();
+
+    // Don't forget to free the mmapped memory
+    if (munmap(file_begin, textsize) == -1)
+    {
+        close(fd);
+        perror("Error un-mmapping the file");
+        exit(EXIT_FAILURE);
+    }
+
+    // Un-mmaping doesn't close the file, so we still need to do that.
+    close(fd);
 }
 
 /* ===================================================================== */
@@ -313,8 +347,7 @@ VOID Fini(INT32 code, VOID *v)
 
 int main(int argc, char *argv[])
 {
-   // a in-memory file we'll be writing to
-  {
+    // a in-memory file we'll be writing to
     /* Open a file for writing.
      *  - Creating the file if it doesn't exist.
      *  - Truncating it to 0 size if it already exists. (not really needed)
@@ -324,9 +357,10 @@ int main(int argc, char *argv[])
     assert( _POSIX_MAPPED_FILES);  
     assert( _POSIX_SYNCHRONIZED_IO);
     
-    const char *filepath = "tmp/mmapped.bin";
+    const char *filepath = KnobOutputFile.Value().c_str();
+    printf("filesize: 0x%x\n", KnobFileSize.Value());
 
-    int fd = open(filepath, O_RDWR | O_CREAT | O_TRUNC, (mode_t)0600);
+    fd = open(filepath, O_RDWR | O_CREAT | O_TRUNC, (mode_t)0600);
     
     if (fd == -1)
     {
@@ -336,7 +370,7 @@ int main(int argc, char *argv[])
 
     // Stretch the file size to the size of the (mmapped) array of char
 
-    size_t textsize = 500;
+    textsize = KnobFileSize.Value(); //0x20000000
     
     if (lseek(fd, textsize-1, SEEK_SET) == -1)
     {
@@ -365,15 +399,15 @@ int main(int argc, char *argv[])
     
 
     // Now the file is ready to be mmapped.
-    char *map = (char *) mmap(0, textsize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (map == MAP_FAILED)
+    file_begin = (char *) mmap(0, textsize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (file_begin == MAP_FAILED)
     {
         close(fd);
         perror("Error mmapping the file");
         exit(EXIT_FAILURE);
     }
 
-    file_in_mem = map;
+    file_in_mem = file_begin;
     
     // Write it now to disk
     //if (msync(map, textsize, MS_SYNC) == -1)
@@ -381,19 +415,6 @@ int main(int argc, char *argv[])
     //    perror("Could not sync the file to disk");
     //}
     
-    // Don't forget to free the mmapped memory
-    if (munmap(map, textsize) == -1)
-    {
-        close(fd);
-        perror("Error un-mmapping the file");
-        exit(EXIT_FAILURE);
-    }
-
-    // Un-mmaping doesn't close the file, so we still need to do that.
-    close(fd);
-} 
-
-
     // Initialize the pin lock
     PIN_InitLock(&lock);
 
@@ -409,9 +430,9 @@ int main(int argc, char *argv[])
     for (int i = 0; i < 128; i++)
       silent[i] = 0;
     
-    TraceFile.open(KnobOutputFile.Value().c_str());
-    TraceFile.write(trace_header.c_str(),trace_header.size());
-    TraceFile.setf(ios::showbase);
+    //TraceFile.open(KnobOutputFile.Value().c_str());
+    //TraceFile.write(trace_header.c_str(),trace_header.size());
+    //TraceFile.setf(ios::showbase);
     
     IMG_AddInstrumentFunction(ImageLoad, 0);
     INS_AddInstrumentFunction(Instruction, 0);
