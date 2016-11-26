@@ -5,6 +5,7 @@ import operator
 import matplotlib.pyplot as plt
 import re
 import os
+import struct
 import pickle
 from collections import deque
 from sys import argv, stdout
@@ -24,38 +25,6 @@ def recordPhase(phases, line, lineno):
     phases.append((lineno, line[3:-4]))
     return
 
-# return s > 1 for RW sharing, s < 0 for WW sharing. s = 1 for RR/no sharing.
-def process(match):
-    threadid = int(match.group(1))
-    # eip = int(match.group(2), 16)
-    isw = (match.group(3) == 'W') # W for write
-    addr = int(match.group(4), 16)
-    addr = addr & ~0xfff # to page
-
-    dq.append((threadid, addr, isw))
-    if addr == ignore_addr: 
-        return 1, 'ignore' # ignore. don't append
-    tidmap = {}
-    for i in dq:
-        if i[1] == addr:
-            if i[0] in tidmap:
-                tidmap[i[0]] += isw
-            else:
-                tidmap[i[0]] = isw
-    if len(tidmap) == 1: return 1, 'rr'
-
-    rw, ww = False, True
-    for v in tidmap.itervalues():
-        if v > 0: # which means it's not read only
-            rw = True
-        else:
-            ww = False
-    if not rw: # RR or no sharing.
-        return len(tidmap), 'rr'
-    elif not ww:
-        return len(tidmap), 'rw'
-    else:
-        return len(tidmap), 'ww'
 
 class AddressCount():
     def __init__(self, name):
@@ -107,6 +76,11 @@ class AddressCount():
                 ss_now += ss[j][1]
         f.write("# End of %s\n\n" % self.name)
 
+    @staticmethod
+    def frequency_count(addrcnts):
+        with open(filename+".frequency", 'w+') as f:
+            for addrcnt in addrcnts:
+                addrcnt.write_output(f)
 
 
 def draw(xData, rrData, rwData, wwData, phases, file_size):
@@ -139,24 +113,159 @@ def draw(xData, rrData, rwData, wwData, phases, file_size):
     plt.savefig('images/' + filename + 'gran=' + str(granularity) + '.png', format='png')
 
 
-def frequency_count(addrcnts):
-    with open(filename+".frequency", 'w+') as f:
-        for addrcnt in addrcnts:
-            addrcnt.write_output(f)
+
+class Analyse():
+    def __init__(self, filename, havetimesig=True, try_backup=True):
+        """
+        havetimesig: whether the file contains "^" to indicate a time interval
+        
+        try_backup: if set, we'll try to restore backup file
+        on the disk (if possible). Otherwise we'll do it again from scratch
+        """
+        self.filename = filename
+        self.file_size = os.path.getsize(self.filename)
+        self.havetimesig = havetimesig
+
+        self.times = []
+        self.times_i = [] # times that filter out ignores
+        self.conflict_cnt=0
+        self.conflict_cnt_i=0
+
+        self.try_backup = try_backup
+        self.backup_filename = filename+'.sz='+str(self.file_size)
+        self.backup=[]
+
+        self.rrcnt = AddressCount("read-read share") # read-read address count
+        self.rwcnt = AddressCount("read-write share")
+        self.wwcnt = AddressCount("write-write share")
+        self.ignores = []
+
+        self.l = {}
+        self.l_i = {}
+
+    def add_ignore(self, ignored):
+        self.ignores.append(ignored)
+
+    def file_pattern(self, f):
+        assert(False)
+
+    def restore(self):
+        if self.try_backup:
+            if os.path.isfile(self.backup_filename):
+                print "reading from persistent file"
+                with open(self.backup_filename) as f:
+                    self.backup = pickle.load(f)
+                    self.times = self.backup[3]
+                    self.times_i = self.backup[4]
+                    self.backup = self.backup[0:3]
+                    return True
+        return False
+
+    def make_backup(self):
+        self.backup = [self.rrcnt, self.rwcnt, self.wwcnt, self.times, self.times_i]
+        with open(self.backup_filename, 'wb+') as f:
+            pickle.dump(self.backup, f, pickle.HIGHEST_PROTOCOL)
+
+    def share_analyse(self):
+        print "frequency count ", self.filename, " filesize:", self.file_size
+        print "granularity:", granularity, " ignore address:", self.ignores
+        print "no draw"
+    
+        if self.restore(): # if there is disk backup, read from it
+            return self.backup # don't have to process again!
+
+        with open(filename) as f:
+            return self.file_pattern(f)
+
+    def draw_timestat(self):
+        plt.figure(num=1, figsize=(18, 12))
+        plt.title('Plot 1', size=14)
+        plt.xlabel('x-axis', size=14)
+        plt.ylabel('y-axis', size=14)
+        # plt.ylim([1, max(rrData)+1])
+
+        xData = np.array(range(len(self.times)))
+        yData = np.array(np.array(self.times))
+        plt.plot(xData, yData, color='black', markersize=3, linestyle='-', marker='.', label='all')
+        if self.ignores: # if not []
+            print "draw ignored"
+            yData = np.array(np.array(self.times_i))
+            plt.plot(xData, yData, color='red', markersize=3, linestyle='-', marker='.', label='without ignored')
+        #for p in self.phases:
+        #    plt.annotate(p[1], xy=(p[0], 1), 
+        #                 xytext=(p[0], 2.5),
+        #                 arrowprops=dict(facecolor='black', shrink=0.05))
+        plt.legend(loc='upper left')
+        plt.savefig('images/' + 'img.' + self.backup_filename + '.png', format='png')
+
+    def record_interval(self):
+        self.times.append(self.conflict_cnt)
+        self.times_i.append(self.conflict_cnt_i)
+        self.conflict_cnt=0
+        self.conflict_cnt_i=0
 
 
-def share_analyse():
-    rrcnt = AddressCount("read-read share") # read-read address count
-    rwcnt = AddressCount("read-write share")
-    wwcnt = AddressCount("write-write share")
-    file_size = os.path.getsize(filename)
-    print "frequency count ", filename, " filesize:", file_size
-    print "granularity:", granularity, " ignore address:", ignore_addr
-    print "no draw"
 
-    pattern = re.compile("\\[(\d+)\\](0x[0-9a-f]+): ([WR]) (0x[0-9a-f]+)") 
-    phases = []
-    with open(filename) as f:
+
+    @staticmethod
+    def process(threadid, isw, addr):
+        """ return s > 1 for RW sharing, s < 0 for WW sharing. s = 1 for RR/no sharing.
+        """
+        addr = addr & ~0xfff # to page
+        dq.append((threadid, addr, isw))
+        if addr == ignore_addr: 
+            return 1, 'ignore' # ignore. don't append
+        tidmap = {}
+        for i in dq:
+            if i[1] == addr:
+                if i[0] in tidmap:
+                    tidmap[i[0]] += isw
+                else:
+                    tidmap[i[0]] = isw
+        if len(tidmap) == 1: return 1, 'rr'
+    
+        rw, ww = False, True
+        for v in tidmap.itervalues():
+            if v > 0: # which means it's not read only
+                rw = True
+            else:
+                ww = False
+        if not rw: # RR or no sharing.
+            return len(tidmap), 'rr'
+        elif not ww:
+            return len(tidmap), 'rw'
+        else:
+            return len(tidmap), 'ww'
+
+class TimeLog:
+    def __init__(self, name="default timelog"):
+        self.name = name
+        self.curr_window = 0 # current window
+        self.rostats = [] # log of all read-only conflicts
+        self.wstats = [] # log of all r-w/w-w conflicts
+
+    def new_interval():
+        wstat, rostat = 0, 0
+        for ops in self.curr_window.values():
+            not_ro = sum(ops) # if all op is read then sum is 0
+            if not_ro:
+                wstat += len(ops)
+            else:
+                rostat += len(ops)
+        self.rostats.append(rostat)
+        self.wstats.append(wstat)
+
+    def log(self, isw, page):
+        if page in self.curr_window:
+            self.curr_window[page].append(isw)
+        else:
+            self.curr_window[page] = [isw]
+
+class StrAnalyse(Analyse):
+    # overwritten
+    def file_pattern(self, f):
+        pattern = re.compile("\\[(\d+)\\](0x[0-9a-f]+): ([WR]) (0x[0-9a-f]+)") 
+        phases = []
         i = 0
         progress = 0
         nextprogress = file_size / 100
@@ -165,7 +274,51 @@ def share_analyse():
             if line.startswith("==="): 
                 recordPhase(phases, line, i)
                 continue
+    
+            # the progress bar
+            if f.tell() >= nextprogress:
+                progress += 1
+                nextprogress = file_size / 100 * (progress+1)
+                stdout.write("progress: %d%%\r" % progress)
+                stdout.flush()
+    
+            match = pattern.match(line)
+            if match:
+                threadid = int(match.group(1))
+                isw = (match.group(3) == 'W') # W for write
+                addr = int(match.group(4), 16)
+                share_cnt, contention = Analyse.process(threadid, isw, addr)
 
+                if contention == 'rr':
+                    if share_cnt > 1: self.rrcnt.addr_log(addr)
+                if contention == 'rw': self.rwcnt.addr_log(addr)
+                if contention == 'ww': self.wwcnt.addr_log(addr)
+                i += 1
+            else:
+                print "Unmatching line", line
+                exit(0)
+        stdout.write("\n")
+        stdout.flush()
+        return [self.rrcnt, self.rwcnt, self.wwcnt]
+    
+
+class BinAnalyse(Analyse):
+    def process_time(self, tid, isw, addr):
+        page = addr & ~0xfff # to page
+
+        self.tlog.log(isw, page)
+        if addr not in self.ignores:
+            self.tlog_i.log(isw, page)
+
+    # overwritten
+    def file_pattern(self, f):
+        self.phases = []
+        i = 0
+        progress = 0
+        file_size = struct.unpack("<Q", f.read(8))[0]
+        stdout.write( "size of binary file: %d\n" % file_size )
+        nextprogress = file_size / 100
+        while f:
             # the progress bar
             if f.tell() >= nextprogress:
                 progress += 1
@@ -173,21 +326,45 @@ def share_analyse():
                 stdout.write("progress: %d%%\r" % progress)
                 stdout.flush()
 
-            match = pattern.match(line)
-            if match:
-                share_cnt, contention = process(match)
-                addr = int(match.group(4), 16)
-                if contention == 'rr':
-                    if share_cnt > 1: rrcnt.addr_log(addr)
-                if contention == 'rw': rwcnt.addr_log(addr)
-                if contention == 'ww': wwcnt.addr_log(addr)
-                i += 1
+            tid = f.read(1)
+            if tid == '#':
+                if 'eof' in f.readline():
+                    break
+            if tid == '=':
+                recordPhase(self.phases, tid+f.readline(), i)
+                continue
+            if tid == '^':
+                self.record_interval()
+                continue
+
+            line = f.read(9)
+            threadid = ord(tid)
+            if (threadid > 10):
+                stdout.write("error threadid:%d" % threadid)
+            isw = (line[0] == 'W')
+            addr = struct.unpack("<Q", line[1:])[0] # 8 byte to int
+
+            if self.havetimesig:
+                self.process_time(threadid, isw, addr)
+
             else:
-                print "Unmatching line", line
-                exit(0)
+                share_cnt, contention = Analyse.process(threadid, isw, addr)
+                
+                # don't care about share_cnt 
+                if self.havetimesig: self.timelog(contention, addr)
+
+                if contention == 'rr':
+                    if share_cnt > 1: self.rrcnt.addr_log(addr)
+                if contention == 'rw': self.rwcnt.addr_log(addr)
+                if contention == 'ww': self.wwcnt.addr_log(addr)
+
+                i += 1
+
+        self.make_backup()
         stdout.write("\n")
         stdout.flush()
-    return [rrcnt, rwcnt, wwcnt]
+        print self.times
+        return [self.rrcnt, self.rwcnt, self.wwcnt]
 
 
 def read_draw():
@@ -229,7 +406,7 @@ def read_draw():
 
                 match = pattern.match(line)
                 if match:
-                    sharing, mode = process(match)
+                    sharing, mode = Analyse.process(match)
                     if mode == 'ignore':
                         xlog.append(i)
                         rr.append(None)
@@ -268,14 +445,30 @@ IGNORE="--ignore"
 GRAN="--granularity"
 SILENT="--silent"
 FREQUENCY_COUNT="-f"
+BIN='-b'
+NEW='--new'
 if __name__ == "__main__":
     filename = argv[1]
     if GRAN in argv:
         granularity = int(argv[argv.index(GRAN)+1])
+
+    if BIN in argv:
+        a = BinAnalyse(filename=filename, try_backup= not NEW in argv) # compressed output file
+    else:
+        a = StrAnalyse(filename)
+
     if IGNORE in argv:
-        ignore_addr = int(argv[argv.index(IGNORE)+1], 16)
+        i = argv.index(IGNORE)+1
+        while i < len(argv) and not argv[i].startswith('-'):
+            ignore_addr = int(argv[i], 16)
+            a.add_ignore(ignore_addr)
+            i+=1
+
+
     if FREQUENCY_COUNT in argv:
-        counts = share_analyse()
-        frequency_count(counts)
+        counts = a.share_analyse()
+        AddressCount.frequency_count(counts)
+        a.draw_timestat()
         exit(0)
+
     read_draw()

@@ -53,6 +53,13 @@ END_LEGAL */
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <assert.h>
+#include <time.h>
+#include <pthread.h>
+#include <errno.h>
+#include <ctype.h>
+
+#include <stdlib.h>
+
 
 static inline VOID* PAGE(VOID* addr)
 {
@@ -65,12 +72,13 @@ static inline VOID* PAGE(VOID* addr)
 
 //std::ofstream TraceFile;
 PIN_LOCK lock;
-char *file_in_mem;
 int fd = -1;
 size_t textsize = 0;
-char *file_begin;
+char *  file_begin;
+char ** file_in_mem; // has to be a char** because we want to share it through processes.
+pid_t timer_pid;
 
-#define mem_printf(...) (file_in_mem += sprintf(file_in_mem, __VA_ARGS__))
+#define mem_printf(len, ...) {char *tmp = __sync_fetch_and_add(file_in_mem, len); assert(len==sprintf(tmp, __VA_ARGS__));}
 
 //static inline void mem_printf(const char *fmt, ...)
 //{
@@ -87,35 +95,13 @@ char *file_begin;
 KNOB<string> KnobOutputFile(KNOB_MODE_WRITEONCE, "pintool",
     "o", "mytrace.out", "specify trace file name");
 KNOB<INT32> KnobFileSize(KNOB_MODE_WRITEONCE, "pintool",
-    "s", "0x40000000"/*1G*/, "specify memory-mapped file size");
+    "s", "0x10000000"/*256M*/, "specify memory-mapped file size");
 KNOB<BOOL> KnobValues(KNOB_MODE_WRITEONCE, "pintool",
     "values", "1", "Output memory values reads and written");
 
 //==============================================================
 //  Analysis Routines
 //==============================================================
-
-// Note:  threadid+1 is used as an argument to the PIN_GetLock()
-//        routine as a debugging aid.  This is the value that
-//        the lock is set to, so it must be non-zero.
-// Note that opening a file in a callback is only supported on Linux systems.
-// See buffer-win.cpp for how to work around this issue on Windows.
-//
-// This routine is executed every time a thread is created.
-VOID ThreadStart(THREADID threadid, CONTEXT *ctxt, INT32 flags, VOID *v)
-{
-    PIN_GetLock(&lock, threadid+1);
-    std::cout << "thread begin " << threadid << endl;
-    PIN_ReleaseLock(&lock);
-}
-
-// This routine is executed every time a thread is destroyed.
-VOID ThreadFini(THREADID threadid, const CONTEXT *ctxt, INT32 code, VOID *v)
-{
-    PIN_GetLock(&lock, threadid+1);
-    std::cout << "thread end " << threadid << endl;
-    PIN_ReleaseLock(&lock);
-}
 
 
 /* ===================================================================== */
@@ -141,21 +127,27 @@ bool silent[128]; // make it sufficiently large
 
 static VOID RecordMem(VOID * ip, CHAR r, VOID * addr, BOOL isPrefetch, THREADID threadid)
 {
-    PIN_GetLock(&lock, threadid+1);
-        
-    //mem_printf("[%d]%lx: %lc %lx\n", threadid, (INT64) ip, r, (INT64) PAGE(addr));
-    //mem_printf("[%d]%lc %lx\n", threadid, r, (INT64) PAGE(addr));
+    //PIN_GetLock(&lock, threadid+1);
+    //    
+    ////mem_printf("[%d]%lx: %lc %lx\n", threadid, (INT64) ip, r, (INT64) PAGE(addr));
+    ////mem_printf("[%d]%lc %lx\n", threadid, r, (INT64) PAGE(addr));
 
-    // This is the bottleneck of performance. total 10 bytes
-    *file_in_mem++ = threadid; // 1 byte
-    *file_in_mem++ = r; // 1 byte
-    *(INT64 *)(file_in_mem) = (INT64) PAGE(addr); // 8 bytes
-    file_in_mem += sizeof(INT64);
-    
-    //*file_in_mem++ = '\n';
-    //mem_printf("[%d]%lc %p\n", threadid, r, PAGE(addr));
+    //// This is the bottleneck of performance. total 10 bytes
+    //*file_in_mem++ = threadid; // 1 byte
+    //*file_in_mem++ = r; // 1 byte
+    //*(INT64 *)(file_in_mem) = (INT64) PAGE(addr); // 8 bytes
+    //file_in_mem += sizeof(INT64);
 
-    PIN_ReleaseLock(&lock);
+    ////*file_in_mem++ = '\n';
+    ////mem_printf("[%d]%lc %p\n", threadid, r, PAGE(addr));
+    //PIN_ReleaseLock(&lock);
+
+    //try this lock-free version!
+    char *our_loc = __sync_fetch_and_add(file_in_mem, 2+sizeof(INT64));
+    *our_loc++ = threadid; // 1 byte
+    *our_loc++ = r; // 1 byte
+    *(INT64 *)(our_loc) = (INT64) PAGE(addr); // 8 bytes
+
 }
 
 static VOID * WriteAddr;
@@ -172,48 +164,29 @@ static VOID RecordMemWrite(VOID * ip, THREADID threadid)
 }
 
 string phases[] = {"map", "reduce", "merge", "start_thread_pool", "edgeMap", "vertexMap"}; 
-string queues[] = {"tq_dequeue"}; 
 // This routine is executed each time phase is called.
 VOID BeforeFunc(INT32 i, THREADID threadid )
 {
-    PIN_GetLock(&lock, threadid+1);
+    //PIN_GetLock(&lock, threadid+1);
     //TraceFile << "=== PHASE : " << phases[i] << " ===";
     //TraceFile << endl;
-    mem_printf("=== PHASE : %s ===\n", phases[i].c_str());
-    printf("=== PHASE : %s ===\n", phases[i].c_str());
-    PIN_ReleaseLock(&lock);
+    int len = 9+phases[i].size();
+    mem_printf(len,"=== %s ===\n", phases[i].c_str());
+    //printf("=== PHASE : %s ===\n", phases[i].c_str());
+    //PIN_ReleaseLock(&lock);
 }
 
 std::map<ADDRINT, int> addr_count;
-VOID BeforeQueue(ADDRINT tq, /*ADDRINT task, int lgrp, int tid,*/ THREADID threadid)
-{
-    PIN_GetLock(&lock, threadid+1);
-    if (addr_count.find(tq) == addr_count.end())
-      addr_count[tq] = 0;
-    else
-      addr_count[tq] += 1;
-    PIN_ReleaseLock(&lock);
-}
+//VOID BeforeQueue(ADDRINT tq, /*ADDRINT task, int lgrp, int tid,*/ THREADID threadid)
+//{
+//    PIN_GetLock(&lock, threadid+1);
+//    if (addr_count.find(tq) == addr_count.end())
+//      addr_count[tq] = 0;
+//    else
+//      addr_count[tq] += 1;
+//    PIN_ReleaseLock(&lock);
+//}
 
-VOID Silent(ADDRINT tq, THREADID threadid)
-{
-    PIN_GetLock(&lock, threadid+1);
-  //std::cout << "silent" << threadid << endl;
-    //if (threadid < 128) silent[threadid] = 1;
-    if (addr_count.find(tq) == addr_count.end())
-      addr_count[tq] = 0;
-    else
-      addr_count[tq] += 1;
-    PIN_ReleaseLock(&lock);
-}
-
-VOID Unsilent(INT32 i, THREADID threadid)
-{
-    PIN_GetLock(&lock, threadid+1);
-  //std::cout << "unsilent" << threadid << endl;
-  //if (threadid < 128) silent[threadid] = 0;
-    PIN_ReleaseLock(&lock);
-}
 
 //====================================================================
 // Instrumentation Routines
@@ -233,23 +206,6 @@ VOID ImageLoad(IMG img, VOID *)
           RTN_Close(rtn);
       }
     }
-
-    for (int i = 0; i < 1; i++) {
-      RTN rtn = RTN_FindByName(img, queues[i].c_str());
-      
-      if ( RTN_Valid( rtn ))
-      {
-          RTN_Open(rtn);
-          // do not record anything memory R/W during this function
-          RTN_InsertCall(rtn, IPOINT_BEFORE, AFUNPTR(Silent),
-                         IARG_FUNCARG_ENTRYPOINT_VALUE, 0, 
-                          IARG_END);
-          RTN_InsertCall(rtn, IPOINT_AFTER, AFUNPTR(Unsilent),
-                   IARG_UINT32, i, IARG_END);
-          RTN_Close(rtn);
-      }
-    }
-
 }
 
 VOID Instruction(INS ins, VOID *v)
@@ -315,7 +271,7 @@ VOID Instruction(INS ins, VOID *v)
 
 VOID Fini(INT32 code, VOID *v)
 {
-    mem_printf("#eof");
+    mem_printf(4,"#eof");
 	
     //TraceFile << "#eof" << endl;
     for (std::map<ADDRINT, int>::iterator it = addr_count.begin(); it != addr_count.end(); it++) {
@@ -325,7 +281,9 @@ VOID Fini(INT32 code, VOID *v)
     // ohhh... mremap is "not yet implemented" by pin...
     //mremap(file_begin, textsize, file_in_mem - file_begin, 0);
  
-    std::cout << "actually filesize: " << std::dec << ((UINT64) file_in_mem - (UINT64)file_begin) / 1024 / 1024  << "M" << endl;
+    // write that size back to the head of file
+    *(uintptr_t *) file_begin = *file_in_mem - file_begin;
+    std::cout << "actually filesize: " << std::dec << *(uintptr_t *) file_begin  << "B" << endl;
     
     //TraceFile.close();
 
@@ -336,18 +294,20 @@ VOID Fini(INT32 code, VOID *v)
         perror("Error un-mmapping the file");
         exit(EXIT_FAILURE);
     }
+    
+    // close timer child process
+    int r;
+    if ((r = kill(timer_pid, SIGKILL)) < 0)
+        printf("can't kill child %d:%s", timer_pid, strerror(errno));
+    else
+        printf("kill child %d successfully\n", timer_pid);
 
     // Un-mmaping doesn't close the file, so we still need to do that.
     close(fd);
 }
 
-/* ===================================================================== */
-/* Main                                                                  */
-/* ===================================================================== */
-
-int main(int argc, char *argv[])
+inline void open_mem_file()
 {
-    // a in-memory file we'll be writing to
     /* Open a file for writing.
      *  - Creating the file if it doesn't exist.
      *  - Truncating it to 0 size if it already exists. (not really needed)
@@ -369,8 +329,7 @@ int main(int argc, char *argv[])
     }
 
     // Stretch the file size to the size of the (mmapped) array of char
-
-    textsize = KnobFileSize.Value(); //0x20000000
+    textsize = KnobFileSize.Value();
     
     if (lseek(fd, textsize-1, SEEK_SET) == -1)
     {
@@ -396,24 +355,64 @@ int main(int argc, char *argv[])
         perror("Error writing last byte of the file");
         exit(EXIT_FAILURE);
     }
-    
 
     // Now the file is ready to be mmapped.
     file_begin = (char *) mmap(0, textsize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+
+    /* 
+     * HACK: Pin prevents us from using PTHREAD, so we use process.
+     * But file_in_mem must be SHARED among processes. Otherwise the lagger
+     * will overwrites the file again. This is a hack trying to provide sharing
+     * variable by making file_in_mem a char** instead of char*.
+     *
+     * file_in_mem and file_begin are not shared among processes.
+     * but the region then point to are.
+     *
+     * | byte N  |
+     * |  ....   |
+     * | ------  |  
+     * | byte 3  | 
+     * | byte 2  | 
+     * | byte 1  |  
+     * | byte 0  |  <- file_begin <- file_in_mem
+     */
     if (file_begin == MAP_FAILED)
     {
         close(fd);
         perror("Error mmapping the file");
         exit(EXIT_FAILURE);
     }
+    file_in_mem = (char **)file_begin;
+    /*
+     * Then shift file_begin, so writing to file DOESN'T overwrite *file_in_mem's data.
+     * Also, init the "point" value "file_in_mem" points to.
+     *
+     * | byte N  |
+     * |  ....   |
+     * | byte 4  |  <- *file_in_mem
+     * | ------- |       ^         
+     * | byte 3  |       |         
+     * | byte 2  |       |          
+     * | byte 1  |       |         
+     * | byte 0  |  <- file_in_mem
+     */
+    *file_in_mem = file_begin + sizeof(char**);
 
-    file_in_mem = file_begin;
-    
-    // Write it now to disk
-    //if (msync(map, textsize, MS_SYNC) == -1)
-    //{
-    //    perror("Could not sync the file to disk");
-    //}
+    printf("file_begin:%p, *file_in_mem:%p\n", file_begin, *file_in_mem);
+}
+
+/* ===================================================================== */
+/* Main                                                                  */
+/* ===================================================================== */
+
+int main(int argc, char *argv[])
+{
+    if( PIN_Init(argc,argv) )
+    {
+        return Usage();
+    }
+
+    open_mem_file(); // just to make it look better
     
     // Initialize the pin lock
     PIN_InitLock(&lock);
@@ -422,10 +421,6 @@ int main(int argc, char *argv[])
                                  "# Memory Access Trace Generated By Pin\n"
                                  "#\n");
     
-    if( PIN_Init(argc,argv) )
-    {
-        return Usage();
-    }
     PIN_InitSymbols();
     for (int i = 0; i < 128; i++)
       silent[i] = 0;
@@ -433,17 +428,38 @@ int main(int argc, char *argv[])
     //TraceFile.open(KnobOutputFile.Value().c_str());
     //TraceFile.write(trace_header.c_str(),trace_header.size());
     //TraceFile.setf(ios::showbase);
+ 
+    // can't dlopen() pthread_create. use trick instread
+    //pthread_t tid;
+    //int s = pthread_create(&tid, 0, &Write, 0);
+    //assert(s == 0);
     
     IMG_AddInstrumentFunction(ImageLoad, 0);
     INS_AddInstrumentFunction(Instruction, 0);
     PIN_AddFiniFunction(Fini, 0);
 
     // Register Analysis routines to be called when a thread begins/ends
-    PIN_AddThreadStartFunction(ThreadStart, 0);
-    PIN_AddThreadFiniFunction(ThreadFini, 0);
+    //PIN_AddThreadStartFunction(ThreadStart, 0);
+    //PIN_AddThreadFiniFunction(ThreadFini, 0);
+
+    printf("start program and counter\n");
+
+    // meet our timer child process!
+    if ((timer_pid = fork()) == 0) { 
+      // We are in the child process.
+      // 1 millisecond = 1e-3 second = 1,000,000 nanoseconds
+      struct timespec ts = {0, 10000000}; // 10 millisecond
+      for (int i = 0; i < 10000; i++) {
+          char *loc = __sync_fetch_and_add(file_in_mem,1);
+          *loc = '^';
+          //printf("%ld\n", loc-file_begin);
+          nanosleep(&ts, NULL);
+      }
+      printf("exit abnormally\n");
+      exit(0);
+    }
 
     // Never returns
-
     PIN_StartProgram();
     
     RecordMemWrite(0, IARG_THREAD_ID);
