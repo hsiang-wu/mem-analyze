@@ -61,6 +61,14 @@ END_LEGAL */
 #include <stdlib.h>
 
 
+static inline UINT64 RDTSC()
+{
+    UINT32 hi, lo;
+    __asm__ volatile("rdtsc" : "=a" (lo), "=d" (hi));
+    return ((UINT64)hi << 32) | lo;
+}
+ 
+
 static inline VOID* PAGE(VOID* addr)
 {
   //return (VOID *)((INT64) addr & ~0xfff);
@@ -95,7 +103,7 @@ pid_t timer_pid;
 KNOB<string> KnobOutputFile(KNOB_MODE_WRITEONCE, "pintool",
     "o", "mytrace.out", "specify trace file name");
 KNOB<INT32> KnobFileSize(KNOB_MODE_WRITEONCE, "pintool",
-    "s", "0x10000000"/*256M*/, "specify memory-mapped file size");
+    "s", "0x20000000"/*256M*/, "specify memory-mapped file size");
 KNOB<BOOL> KnobValues(KNOB_MODE_WRITEONCE, "pintool",
     "values", "1", "Output memory values reads and written");
 
@@ -143,10 +151,13 @@ static VOID RecordMem(VOID * ip, CHAR r, VOID * addr, BOOL isPrefetch, THREADID 
     //PIN_ReleaseLock(&lock);
 
     //try this lock-free version!
-    char *our_loc = __sync_fetch_and_add(file_in_mem, 2+sizeof(INT64));
+    uint64_t t = RDTSC();
+    char *our_loc = __sync_fetch_and_add(file_in_mem, 2+1*sizeof(INT64));
     *our_loc++ = threadid; // 1 byte
     *our_loc++ = r; // 1 byte
     *(INT64 *)(our_loc) = (INT64) PAGE(addr); // 8 bytes
+    our_loc += sizeof(INT64);
+    *(UINT64 *)(our_loc) = (UINT64) t;
 
 }
 
@@ -283,7 +294,7 @@ VOID Fini(INT32 code, VOID *v)
  
     // write that size back to the head of file
     *(uintptr_t *) file_begin = *file_in_mem - file_begin;
-    std::cout << "actually filesize: " << std::dec << *(uintptr_t *) file_begin  << "B" << endl;
+    std::cout << "actual filesize: " << std::dec << *(uintptr_t *) file_begin  << "B" << endl;
     
     //TraceFile.close();
 
@@ -296,14 +307,21 @@ VOID Fini(INT32 code, VOID *v)
     }
     
     // close timer child process
-    int r;
-    if ((r = kill(timer_pid, SIGKILL)) < 0)
-        printf("can't kill child %d:%s", timer_pid, strerror(errno));
-    else
-        printf("kill child %d successfully\n", timer_pid);
+    // int r;
+    // if ((r = kill(timer_pid, SIGKILL)) < 0)
+    //     printf("can't kill child %d:%s", timer_pid, strerror(errno));
+    // else
+    //     printf("kill child %d successfully\n", timer_pid);
 
     // Un-mmaping doesn't close the file, so we still need to do that.
     close(fd);
+}
+
+void ThreadStart(THREADID tid, CONTEXT *ctxt, INT32 flags, VOID *v)
+{
+    PIN_GetLock(&lock, tid+1);
+    printf("thread:%d\n", tid);
+    PIN_ReleaseLock(&lock);
 }
 
 inline void open_mem_file()
@@ -439,25 +457,24 @@ int main(int argc, char *argv[])
     PIN_AddFiniFunction(Fini, 0);
 
     // Register Analysis routines to be called when a thread begins/ends
-    //PIN_AddThreadStartFunction(ThreadStart, 0);
-    //PIN_AddThreadFiniFunction(ThreadFini, 0);
+    PIN_AddThreadStartFunction(ThreadStart, 0);
 
     printf("start program and counter\n");
 
     // meet our timer child process!
-    if ((timer_pid = fork()) == 0) { 
-      // We are in the child process.
-      // 1 millisecond = 1e-3 second = 1,000,000 nanoseconds
-      struct timespec ts = {0, 10000000}; // 10 millisecond
-      for (int i = 0; i < 10000; i++) {
-          char *loc = __sync_fetch_and_add(file_in_mem,1);
-          *loc = '^';
-          //printf("%ld\n", loc-file_begin);
-          nanosleep(&ts, NULL);
-      }
-      printf("exit abnormally\n");
-      exit(0);
-    }
+    // if ((timer_pid = fork()) == 0) { 
+    //   // We are in the child process.
+    //   // 1 millisecond = 1e-3 second = 1,000,000 nanoseconds
+    //   struct timespec ts = {0, 500000}; // 0.5 millisecond
+    //   for (int i = 0; i < 100000; i++) {
+    //       char *loc = __sync_fetch_and_add(file_in_mem,1);
+    //       *loc = '^';
+    //       //printf("%ld\n", loc-file_begin);
+    //       nanosleep(&ts, NULL);
+    //   }
+    //   printf("exit abnormally\n");
+    //   exit(0);
+    // }
 
     // Never returns
     PIN_StartProgram();

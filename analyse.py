@@ -31,25 +31,25 @@ class AddressCount():
         self.page_freq = {}
         self.name = name
 
-    def addr_log(self, addr):
+    def addr_log(self, addr, count=1):
         #if addr in self.addr_freq:
         #    self.addr_freq[addr] += 1
         #else:
         #    self.addr_freq[addr] = 0
         page = addr & ~0xfff
         if page in self.page_freq:
-            self.page_freq[page][0] += 1
+            self.page_freq[page][0] += count
             if addr in self.page_freq[page][1]:
-                self.page_freq[page][1][addr] += 1
+                self.page_freq[page][1][addr] += count
             else:
-                self.page_freq[page][1][addr] = 0
+                self.page_freq[page][1][addr] = count
         else:
             self.page_freq[page] = [0, # frequency
                                     {} # child addressess
                                    ]
 
     def write_output(self, f):
-        PORTION = 0.8
+        PORTION = 0.9
         f.write("# \n")
         f.write("# Output for %s\n" % self.name)
         f.write("# \n")
@@ -64,6 +64,7 @@ class AddressCount():
 
         for i in range(len(s)/4+1): # only display first 1/4
             if (s_now > PORTION * s_sum): break
+            if s_sum == 0: break
             f.write("0x%x\t\t%d\t%d%%\n" % (s[i][0], s[i][1][0], s[i][1][0] * 100 / s_sum))
             s_now += s[i][1][0]
 
@@ -72,12 +73,13 @@ class AddressCount():
             ss_now = 0
             for j in range(len(ss)/4+1):
                 if (ss_now > PORTION * ss_sum): break
-                f.write("|-0x%x\t%d%%\n" % (ss[j][0], ss[j][1] * 100 / ss_sum))
+                if ss_sum: f.write("|-0x%x\t%d%%\n" % (ss[j][0], ss[j][1] * 100 / ss_sum))
                 ss_now += ss[j][1]
         f.write("# End of %s\n\n" % self.name)
 
     @staticmethod
     def frequency_count(addrcnts):
+        print "creating file",filename,".frequency"
         with open(filename+".frequency", 'w+') as f:
             for addrcnt in addrcnts:
                 addrcnt.write_output(f)
@@ -126,10 +128,8 @@ class Analyse():
         self.file_size = os.path.getsize(self.filename)
         self.havetimesig = havetimesig
 
-        self.times = []
-        self.times_i = [] # times that filter out ignores
-        self.conflict_cnt=0
-        self.conflict_cnt_i=0
+        self.tlog = TimeLog("all")
+        self.tlog_i = TimeLog("ignore") # times that filter out ignores
 
         self.try_backup = try_backup
         self.backup_filename = filename+'.sz='+str(self.file_size)
@@ -142,6 +142,7 @@ class Analyse():
 
         self.l = {}
         self.l_i = {}
+        self.phases=[]
 
     def add_ignore(self, ignored):
         self.ignores.append(ignored)
@@ -155,14 +156,15 @@ class Analyse():
                 print "reading from persistent file"
                 with open(self.backup_filename) as f:
                     self.backup = pickle.load(f)
-                    self.times = self.backup[3]
-                    self.times_i = self.backup[4]
+                    self.tlog = self.backup[3]
+                    self.tlog_i = self.backup[4]
+                    self.phases = self.backup[5]
                     self.backup = self.backup[0:3]
                     return True
         return False
 
     def make_backup(self):
-        self.backup = [self.rrcnt, self.rwcnt, self.wwcnt, self.times, self.times_i]
+        self.backup = [self.rrcnt, self.rwcnt, self.wwcnt, self.tlog, self.tlog_i, self.phases]
         with open(self.backup_filename, 'wb+') as f:
             pickle.dump(self.backup, f, pickle.HIGHEST_PROTOCOL)
 
@@ -184,28 +186,20 @@ class Analyse():
         plt.ylabel('y-axis', size=14)
         # plt.ylim([1, max(rrData)+1])
 
-        xData = np.array(range(len(self.times)))
-        yData = np.array(np.array(self.times))
-        plt.plot(xData, yData, color='black', markersize=3, linestyle='-', marker='.', label='all')
+        self.tlog.draw()
         if self.ignores: # if not []
             print "draw ignored"
-            yData = np.array(np.array(self.times_i))
-            plt.plot(xData, yData, color='red', markersize=3, linestyle='-', marker='.', label='without ignored')
-        #for p in self.phases:
-        #    plt.annotate(p[1], xy=(p[0], 1), 
-        #                 xytext=(p[0], 2.5),
-        #                 arrowprops=dict(facecolor='black', shrink=0.05))
+            self.tlog_i.draw()
+        for p in self.phases:
+            plt.annotate(p[1], xy=(p[0], 1), 
+                         xytext=(p[0], max(self.tlog.wstats)/5),
+                         arrowprops=dict(facecolor='black', shrink=0.05))
         plt.legend(loc='upper left')
         plt.savefig('images/' + 'img.' + self.backup_filename + '.png', format='png')
 
     def record_interval(self):
-        self.times.append(self.conflict_cnt)
-        self.times_i.append(self.conflict_cnt_i)
-        self.conflict_cnt=0
-        self.conflict_cnt_i=0
-
-
-
+        self.tlog.new_interval(self.rrcnt, self.wwcnt)
+        self.tlog_i.new_interval()
 
     @staticmethod
     def process(threadid, isw, addr):
@@ -213,7 +207,7 @@ class Analyse():
         """
         addr = addr & ~0xfff # to page
         dq.append((threadid, addr, isw))
-        if addr == ignore_addr: 
+        if addr == ignore_addr:
             return 1, 'ignore' # ignore. don't append
         tidmap = {}
         for i in dq:
@@ -240,26 +234,41 @@ class Analyse():
 class TimeLog:
     def __init__(self, name="default timelog"):
         self.name = name
-        self.curr_window = 0 # current window
+        self.curr_window = {} # current window
         self.rostats = [] # log of all read-only conflicts
         self.wstats = [] # log of all r-w/w-w conflicts
 
-    def new_interval():
+    def draw(self, ls='-'):
+        xData = np.array(range(len(self.rostats)))
+        yData = np.array(np.array(self.rostats))
+        plt.plot(xData, yData, color=np.random.rand(3,1), markersize=3, linestyle=ls, marker='.', label=self.name+" shared-read")
+        xData = np.array(range(len(self.wstats)))
+        yData = np.array(np.array(self.wstats))
+        plt.plot(xData, yData, color=np.random.rand(3,1), markersize=5, linestyle='--', marker='x', label=self.name+" rw/ww")
+
+    def new_interval(self, rrcnt=None, wwcnt=None):
         wstat, rostat = 0, 0
-        for ops in self.curr_window.values():
+        for page in self.curr_window:
+            tids, ops = self.curr_window[page]
+            if len(tids) == 1: continue
             not_ro = sum(ops) # if all op is read then sum is 0
             if not_ro:
                 wstat += len(ops)
+                if wwcnt: wwcnt.addr_log(page, len(ops))
             else:
                 rostat += len(ops)
+                if rrcnt: rrcnt.addr_log(page, len(ops))
         self.rostats.append(rostat)
         self.wstats.append(wstat)
+        self.curr_window.clear()
 
-    def log(self, isw, page):
+    def log(self, isw, page, tid):
         if page in self.curr_window:
-            self.curr_window[page].append(isw)
+            self.curr_window[page][0].add(tid)
+            self.curr_window[page][1].append(isw)
         else:
-            self.curr_window[page] = [isw]
+            self.curr_window[page] = [set([tid]), []]
+            self.curr_window[page][1] = [isw]
 
 class StrAnalyse(Analyse):
     # overwritten
@@ -306,13 +315,12 @@ class BinAnalyse(Analyse):
     def process_time(self, tid, isw, addr):
         page = addr & ~0xfff # to page
 
-        self.tlog.log(isw, page)
-        if addr not in self.ignores:
-            self.tlog_i.log(isw, page)
+        self.tlog.log(isw, page, tid)
+        if page not in self.ignores:
+            self.tlog_i.log(isw, page, tid)
 
     # overwritten
     def file_pattern(self, f):
-        self.phases = []
         i = 0
         progress = 0
         file_size = struct.unpack("<Q", f.read(8))[0]
@@ -335,6 +343,7 @@ class BinAnalyse(Analyse):
                 continue
             if tid == '^':
                 self.record_interval()
+                i += 1
                 continue
 
             line = f.read(9)
@@ -350,9 +359,6 @@ class BinAnalyse(Analyse):
             else:
                 share_cnt, contention = Analyse.process(threadid, isw, addr)
                 
-                # don't care about share_cnt 
-                if self.havetimesig: self.timelog(contention, addr)
-
                 if contention == 'rr':
                     if share_cnt > 1: self.rrcnt.addr_log(addr)
                 if contention == 'rw': self.rwcnt.addr_log(addr)
@@ -360,10 +366,10 @@ class BinAnalyse(Analyse):
 
                 i += 1
 
+        self.record_interval()
         self.make_backup()
         stdout.write("\n")
         stdout.flush()
-        print self.times
         return [self.rrcnt, self.rwcnt, self.wwcnt]
 
 
@@ -445,6 +451,7 @@ IGNORE="--ignore"
 GRAN="--granularity"
 SILENT="--silent"
 FREQUENCY_COUNT="-f"
+TIMSIG='-t'
 BIN='-b'
 NEW='--new'
 if __name__ == "__main__":
@@ -453,7 +460,7 @@ if __name__ == "__main__":
         granularity = int(argv[argv.index(GRAN)+1])
 
     if BIN in argv:
-        a = BinAnalyse(filename=filename, try_backup= not NEW in argv) # compressed output file
+        a = BinAnalyse(filename=filename, havetimesig=TIMSIG in argv, try_backup= not NEW in argv) # compressed output file
     else:
         a = StrAnalyse(filename)
 
@@ -461,7 +468,8 @@ if __name__ == "__main__":
         i = argv.index(IGNORE)+1
         while i < len(argv) and not argv[i].startswith('-'):
             ignore_addr = int(argv[i], 16)
-            a.add_ignore(ignore_addr)
+            #a.add_ignore(ignore_addr)
+            a.add_ignore(ignore_addr & ~0xfff)
             i+=1
 
 
