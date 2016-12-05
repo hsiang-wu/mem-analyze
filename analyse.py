@@ -319,6 +319,9 @@ class BinAnalyse(Analyse):
         if page not in self.ignores:
             self.tlog_i.log(isw, page, tid)
 
+    def log_timestamp(self, ts):
+        pass
+
     # overwritten
     def file_pattern(self, f):
         i = 0
@@ -341,30 +344,24 @@ class BinAnalyse(Analyse):
             if tid == '=':
                 recordPhase(self.phases, tid+f.readline(), i)
                 continue
-            if tid == '^':
-                self.record_interval()
-                i += 1
-                continue
 
-            line = f.read(9)
+            line = f.read(17) # 1 byte for W/R, 8 for addr, 8 for timestamp
             threadid = ord(tid)
             if (threadid > 10):
                 stdout.write("error threadid:%d" % threadid)
             isw = (line[0] == 'W')
-            addr = struct.unpack("<Q", line[1:])[0] # 8 byte to int
+            addr = struct.unpack("<Q", line[1:9])[0] # 8 byte to int
+            timestamp = struct.unpack("<Q", line[9:])[0] # < for little-endian, Q for unsigned 8 bytes
+            self.log_timestamp(timestamp)
 
-            if self.havetimesig:
-                self.process_time(threadid, isw, addr)
+            share_cnt, contention = Analyse.process(threadid, isw, addr)
+            
+            if contention == 'rr':
+                if share_cnt > 1: self.rrcnt.addr_log(addr)
+            if contention == 'rw': self.rwcnt.addr_log(addr)
+            if contention == 'ww': self.wwcnt.addr_log(addr)
 
-            else:
-                share_cnt, contention = Analyse.process(threadid, isw, addr)
-                
-                if contention == 'rr':
-                    if share_cnt > 1: self.rrcnt.addr_log(addr)
-                if contention == 'rw': self.rwcnt.addr_log(addr)
-                if contention == 'ww': self.wwcnt.addr_log(addr)
-
-                i += 1
+            i += 1
 
         self.record_interval()
         self.make_backup()
